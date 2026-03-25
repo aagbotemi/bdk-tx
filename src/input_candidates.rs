@@ -28,6 +28,7 @@ fn cs_candidate_from_group(group: &InputGroup) -> Candidate {
         weight: group.weight(),
         input_count: group.input_count(),
         is_segwit: group.is_segwit(),
+        ancestor_bump_fee: group.ancestor_bump_fee(),
     }
 }
 

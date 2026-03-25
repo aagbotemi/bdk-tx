@@ -197,6 +197,7 @@ pub struct Input {
     plan: PlanOrPsbtInput,
     status: Option<ConfirmationStatus>,
     is_coinbase: bool,
+    ancestor_bump_fee: u64,
 }
 
 impl Input {
@@ -224,6 +225,7 @@ impl Input {
             plan: PlanOrPsbtInput::Plan(Box::new(plan)),
             status,
             is_coinbase,
+            ancestor_bump_fee: 0,
         })
     }
 
@@ -242,6 +244,7 @@ impl Input {
             plan: PlanOrPsbtInput::Plan(Box::new(plan)),
             status,
             is_coinbase,
+            ancestor_bump_fee: 0,
         }
     }
 
@@ -304,6 +307,7 @@ impl Input {
             plan,
             status,
             is_coinbase,
+            ancestor_bump_fee: 0,
         })
     }
 
@@ -510,6 +514,17 @@ impl Input {
     pub fn is_segwit(&self) -> bool {
         self.plan.is_segwit()
     }
+
+    /// Set the ancestor bump fee for this input.
+    pub fn set_ancestor_bump_fee(mut self, fee: u64) -> Self {
+        self.ancestor_bump_fee = fee;
+        self
+    }
+
+    /// The ancestor bump fee for this input.
+    pub fn ancestor_bump_fee(&self) -> u64 {
+        self.ancestor_bump_fee
+    }
 }
 
 /// Input group. Cannot be empty.
@@ -661,5 +676,10 @@ impl InputGroup {
     /// Whether any contained input is a segwit spend.
     pub fn is_segwit(&self) -> bool {
         self.inputs().iter().any(|input| input.is_segwit())
+    }
+
+    /// Total ancestor bump fee across all inputs in this group.
+    pub fn ancestor_bump_fee(&self) -> u64 {
+        self.inputs().iter().map(|i| i.ancestor_bump_fee).sum()
     }
 }
