@@ -683,3 +683,52 @@ impl InputGroup {
         self.inputs().iter().map(|i| i.ancestor_bump_fee).sum()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::{secp256k1::Secp256k1, transaction, Amount, Transaction, TxIn, TxOut};
+    use miniscript::{plan::Assets, Descriptor, DescriptorPublicKey};
+
+    const TEST_DESCRIPTOR: &str = "tr([5940b9b9/86'/0'/0']tpubDDVNqmq75GNPWQ9UNKfP43UwjaHU4GYfoPavojQbfpyfZp2KetWgjGBRRAy4tYCrAA6SB11mhQAkqxjh1VtQHyKwT4oYxpwLaGHvoKmtxZf/0/*)";
+    const TEST_DESCRIPTOR_PK: &str = "[5940b9b9/86'/0'/0']tpubDDVNqmq75GNPWQ9UNKfP43UwjaHU4GYfoPavojQbfpyfZp2KetWgjGBRRAy4tYCrAA6SB11mhQAkqxjh1VtQHyKwT4oYxpwLaGHvoKmtxZf/0/*";
+
+    fn make_test_input() -> Input {
+        let secp = Secp256k1::new();
+        let (desc, _) = Descriptor::parse_descriptor(&secp, TEST_DESCRIPTOR).unwrap();
+        let def_desc = desc.at_derivation_index(0).unwrap();
+        let desc_pk: DescriptorPublicKey = TEST_DESCRIPTOR_PK.parse().unwrap();
+        let plan = def_desc
+            .clone()
+            .plan(&Assets::new().add(desc_pk))
+            .expect("failed to create plan");
+
+        let prev_tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![TxOut {
+                script_pubkey: def_desc.script_pubkey(),
+                value: Amount::from_sat(100_000),
+            }],
+        };
+
+        Input::from_prev_tx(plan, prev_tx, 0, None).unwrap()
+    }
+
+    #[test]
+    fn test_input_group_ancestor_bump_fee() {
+        // Defaults to zero when no bump fees are set.
+        let a = make_test_input();
+        let b = make_test_input();
+        let group_ab = InputGroup::from_inputs([a, b]).unwrap();
+        assert_eq!(group_ab.ancestor_bump_fee(), 0);
+
+        // Sums across inputs.
+        let c = make_test_input().set_ancestor_bump_fee(10_000);
+        let d = make_test_input().set_ancestor_bump_fee(30_000);
+        let e = make_test_input().set_ancestor_bump_fee(20_000);
+        let group_cde = InputGroup::from_inputs(vec![c, d, e]).unwrap();
+        assert_eq!(group_cde.ancestor_bump_fee(), 60_000);
+    }
+}
