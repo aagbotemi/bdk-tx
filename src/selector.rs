@@ -671,5 +671,79 @@ mod tests {
         ));
         Ok(())
     }
-    
+
+    #[test]
+    fn lowest_fee_bnb_drops_change_to_fit_max_weight() -> anyhow::Result<()> {
+        let input = setup_cltv_input(absolute::LockTime::from_consensus(10_000))?;
+        let spk = input.prev_txout().script_pubkey.clone();
+        let candidates = InputCandidates::new([], [input]);
+
+        let make_params = || {
+            SelectorParams::new(
+                FeeRate::from_sat_per_vb_u32(2),
+                vec![Output::with_script(spk.clone(), Amount::from_sat(10_000))],
+                ChangeScript::from_script(spk.clone(), Weight::ZERO),
+            )
+        };
+
+        // Measure the transaction's weight with and without change.
+        let (without_change, with_change) = {
+            let mut selector = Selector::new(&candidates, make_params()).expect("valid selector");
+            selector.select_all();
+            let drain_weights = selector.cs_change_policy().drain_weights;
+            (
+                selector.inner().weight(bdk_coin_select::DrainWeights::NONE),
+                selector.inner().weight(drain_weights),
+            )
+        };
+        assert!(without_change < with_change);
+
+        // A cap that fits the changeless transaction only. The change policy alone would add
+        // change here, so this only succeeds if BnB's decision to drop it is kept.
+        let mut params = make_params();
+        params.max_weight = Weight::from_wu(without_change);
+
+        let selection = candidates
+            .into_selection(
+                selection_algorithm_lowest_fee_bnb(FeeRate::from_sat_per_vb_u32(1), 100_000),
+                params,
+            )
+            .expect("BnB should find the changeless selection");
+
+        assert_eq!(
+            selection.outputs().len(),
+            1,
+            "change should be dropped to fit max_weight"
+        );
+        assert_eq!(selection.outputs()[0].value, Amount::from_sat(10_000));
+        Ok(())
+    }
+
+    #[test]
+    fn into_selection_errors_when_max_weight_exceeded() -> anyhow::Result<()> {
+        let input = setup_cltv_input(absolute::LockTime::from_consensus(10_000))?;
+        let recipient_spk = input.prev_txout().script_pubkey.clone();
+        let candidates = InputCandidates::new([], [input]);
+
+        let mut params = SelectorParams::new(
+            FeeRate::from_sat_per_vb_u32(2),
+            vec![Output::with_script(recipient_spk, Amount::from_sat(10_000))],
+            ChangeScript::from_script(ScriptBuf::new(), Weight::ZERO),
+        );
+        params.max_weight = Weight::from_wu(100);
+
+        let err = candidates
+            .into_selection(|selector| selector.select_until_target_met(), params)
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                IntoSelectionError::SelectionAlgorithm(SelectorError::MaxWeightExceeded)
+            ),
+            "expected MaxWeightExceeded, got {err:?}"
+        );
+
+        Ok(())
+    }
 }
