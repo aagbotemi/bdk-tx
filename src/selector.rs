@@ -18,7 +18,6 @@ use core::fmt::{self, Debug};
 pub struct Selector<'c> {
     candidates: &'c InputCandidates,
     target_outputs: Vec<Output>,
-    target: Target,
     change_policy: bdk_coin_select::ChangePolicy,
     change_script: ScriptSource,
     /// Dust relay feerate [`LowestFee`] uses to judge change as dust.
@@ -34,8 +33,12 @@ pub struct Selector<'c> {
 
 /// Parameters for creating tx.
 ///
-/// Required fields are set via [`SelectorParams::new`]; optional fields are
-/// set directly on the struct.
+/// TODO: Create a builder interface on this that does checks. I.e.
+/// * Error if recipient is dust.
+/// * Error on multi OP_RETURN outputs.
+/// * Error on anything that does not satisfy mempool policy.
+///   If the caller wants to create non-mempool-policy conforming txs, they can just fill in the
+///   fields directly.
 #[derive(Debug)]
 pub struct SelectorParams {
     /// Target feerate.
@@ -386,8 +389,6 @@ pub enum SelectorError {
     LockTypeMismatch,
     /// The selection exceeds the maximum allowed transaction weight.
     MaxWeightExceeded,
-    /// Not enough value in the candidates to meet the target.
-    InsufficientFunds(bdk_coin_select::InsufficientFunds),
 }
 
 impl fmt::Display for SelectorError {
@@ -405,7 +406,6 @@ impl fmt::Display for SelectorError {
                 f,
                 "selection exceeds the maximum allowed transaction weight"
             ),
-            Self::InsufficientFunds(e) => write!(f, "{}", e),
         }
     }
 }
@@ -413,7 +413,7 @@ impl fmt::Display for SelectorError {
 impl From<SelectError> for SelectorError {
     fn from(e: SelectError) -> Self {
         match e {
-            SelectError::InsufficientFunds(e) => Self::InsufficientFunds(e),
+            SelectError::InsufficientFunds(_) => Self::CannotMeetTarget(CannotMeetTarget),
             SelectError::MaxWeightExceeded => Self::MaxWeightExceeded,
         }
     }
@@ -436,7 +436,8 @@ impl<'c> Selector<'c> {
         let target = params.to_cs_target();
         let change_policy = params.to_cs_change_policy()?;
 
-        let min_change_value = params.min_change_value(&params.change_script.source().script());
+        let change_script = params.change_script.source();
+        let min_change_value = params.min_change_value(&change_script.script());
 
         let dust_relay_feerate = params
             .change_dust_relay_feerate
@@ -444,7 +445,6 @@ impl<'c> Selector<'c> {
             .into_cs_feerate();
 
         let target_outputs = params.target_outputs;
-        let change_script = params.change_script.source();
 
         if target.value() > candidates.groups().map(|grp| grp.value().to_sat()).sum() {
             return Err(SelectorError::CannotMeetTarget(CannotMeetTarget));
@@ -471,7 +471,6 @@ impl<'c> Selector<'c> {
         }
         Ok(Self {
             candidates,
-            target,
             target_outputs,
             change_policy,
             change_script,
@@ -497,7 +496,7 @@ impl<'c> Selector<'c> {
 
     /// Coin selection target.
     pub fn target(&self) -> Target {
-        self.target
+        self.inner.target()
     }
 
     /// Coin selection change policy.
@@ -547,29 +546,27 @@ impl<'c> Selector<'c> {
 
     /// Estimated weight of the transaction.
     pub fn weight(&self) -> Weight {
-        self.weight_with(self.effective_drain())
+        Weight::from_wu(self.inner.weight(self.effective_drain().weights))
     }
 
-    /// Maximum allowed transaction weight.
-    pub fn max_weight(&self) -> Weight {
-        Weight::from_wu(
-            self.target
-                .max_weight
-                .expect("to_cs_target always sets max_weight"),
-        )
-    }
-
-    /// Estimated weight of the transaction for a given drain decision.
-    fn weight_with(&self, drain: Drain) -> Weight {
-        Weight::from_wu(self.inner.weight(drain.weights))
+    /// Maximum allowed transaction weight, if any.
+    pub fn max_weight(&self) -> Option<Weight> {
+        self.inner.target().max_weight.map(Weight::from_wu)
     }
 
     /// Run branch and bound with [`LowestFee`], keeping the change decision it makes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NoBnbSolution::MaxWeightExceeded`] if the best selection only fits
+    /// [`SelectorParams::max_weight`] by dropping change that is worth keeping.
     pub fn run_lowest_fee_bnb(
         &mut self,
         long_term_feerate: FeeRate,
         max_rounds: usize,
     ) -> Result<(), NoBnbSolution> {
+        self.drain = None;
+
         let metric = LowestFee {
             long_term_feerate: long_term_feerate.into_cs_feerate(),
             dust_relay_feerate: self.dust_relay_feerate,
@@ -577,8 +574,17 @@ impl<'c> Selector<'c> {
         };
         let (_, mut drain) = self.inner.run_bnb(metric, max_rounds)?;
 
-        // LowestFee only knows the dust threshold at the relay feerate, so also enforce `change_min_value`.
-        // Dropping change only lowers weight, so the selection still fits `max_weight`.
+        // LowestFee drops change that would exceed `max_weight` and pays it as fee instead.
+        if drain.is_none()
+            && self.inner.drain(self.change_policy).is_some()
+            && !self
+                .inner
+                .is_within_max_weight(self.change_policy.drain_weights)
+        {
+            return Err(NoBnbSolution::MaxWeightExceeded);
+        }
+
+        // LowestFee doesn't know `change_min_value`, so enforce it here.
         if drain.is_some() && drain.value <= self.min_change_value {
             drain = Drain::NONE;
         }
@@ -595,7 +601,8 @@ impl<'c> Selector<'c> {
     /// - [`SelectorError::MaxWeightExceeded`] if the estimated transaction weight exceeds [`SelectorParams::max_weight`].
     pub fn try_finalize(&self) -> Result<Selection, SelectorError> {
         let drain = self.effective_drain();
-        if self.weight_with(drain) > self.max_weight() {
+
+        if !self.inner.is_within_max_weight(drain.weights) {
             return Err(SelectorError::MaxWeightExceeded);
         }
 
@@ -617,6 +624,7 @@ impl<'c> Selector<'c> {
                 Amount::from_sat(drain.value),
             )));
         }
+
         Ok(Selection::new(inputs, outputs))
     }
 }
@@ -673,11 +681,10 @@ mod tests {
     }
 
     #[test]
-    fn lowest_fee_bnb_drops_change_to_fit_max_weight() -> anyhow::Result<()> {
+    fn lowest_fee_bnb_errors_instead_of_burning_change() -> anyhow::Result<()> {
         let input = setup_cltv_input(absolute::LockTime::from_consensus(10_000))?;
         let spk = input.prev_txout().script_pubkey.clone();
         let candidates = InputCandidates::new([], [input]);
-
         let make_params = || {
             SelectorParams::new(
                 FeeRate::from_sat_per_vb_u32(2),
@@ -686,39 +693,67 @@ mod tests {
             )
         };
 
-        // Measure the transaction's weight with and without change.
-        let (without_change, with_change) = {
-            let mut selector = Selector::new(&candidates, make_params()).expect("valid selector");
+        // Weight of the transaction with no change.
+        let without_change = {
+            let mut selector = Selector::new(&candidates, make_params())?;
             selector.select_all();
-            let drain_weights = selector.cs_change_policy().drain_weights;
-            (
-                selector.inner().weight(bdk_coin_select::DrainWeights::NONE),
-                selector.inner().weight(drain_weights),
-            )
+            selector.inner().weight(bdk_coin_select::DrainWeights::NONE)
         };
-        assert!(without_change < with_change);
 
-        // A cap that fits the changeless transaction only. The change policy alone would add
-        // change here, so this only succeeds if BnB's decision to drop it is kept.
+        // The changeless transaction fits, but the change output does not. Dropping change here
+        // would pay almost the whole 1 BTC input as fee.
         let mut params = make_params();
         params.max_weight = Weight::from_wu(without_change);
 
-        let selection = candidates
+        let err = candidates
             .into_selection(
                 selection_algorithm_lowest_fee_bnb(FeeRate::from_sat_per_vb_u32(1), 100_000),
                 params,
             )
-            .expect("BnB should find the changeless selection");
-
-        assert_eq!(
-            selection.outputs().len(),
-            1,
-            "change should be dropped to fit max_weight"
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                IntoSelectionError::SelectionAlgorithm(
+                    bdk_coin_select::NoBnbSolution::MaxWeightExceeded
+                )
+            ),
+            "expected MaxWeightExceeded, got {err:?}"
         );
-        assert_eq!(selection.outputs()[0].value, Amount::from_sat(10_000));
         Ok(())
     }
 
+    #[test]
+    fn lowest_fee_bnb_keeps_change_that_fits_max_weight() -> anyhow::Result<()> {
+        let input = setup_cltv_input(absolute::LockTime::from_consensus(10_000))?;
+        let spk = input.prev_txout().script_pubkey.clone();
+        let candidates = InputCandidates::new([], [input]);
+        let make_params = || {
+            SelectorParams::new(
+                FeeRate::from_sat_per_vb_u32(2),
+                vec![Output::with_script(spk.clone(), Amount::from_sat(10_000))],
+                ChangeScript::from_script(spk.clone(), Weight::ZERO),
+            )
+        };
+
+        // Cap exactly at the weight with change.
+        let with_change = {
+            let mut selector = Selector::new(&candidates, make_params())?;
+            selector.select_all();
+            selector
+                .inner()
+                .weight(selector.cs_change_policy().drain_weights)
+        };
+        let mut params = make_params();
+        params.max_weight = Weight::from_wu(with_change);
+
+        let selection = candidates.into_selection(
+            selection_algorithm_lowest_fee_bnb(FeeRate::from_sat_per_vb_u32(1), 100_000),
+            params,
+        )?;
+        assert_eq!(selection.outputs().len(), 2, "change must be kept");
+        Ok(())
+    }
     #[test]
     fn into_selection_errors_when_max_weight_exceeded() -> anyhow::Result<()> {
         let input = setup_cltv_input(absolute::LockTime::from_consensus(10_000))?;
@@ -744,6 +779,89 @@ mod tests {
             "expected MaxWeightExceeded, got {err:?}"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn max_weight_is_none_when_target_has_no_cap() -> anyhow::Result<()> {
+        let input = setup_cltv_input(absolute::LockTime::from_consensus(10_000))?;
+        let spk = input.prev_txout().script_pubkey.clone();
+        let candidates = InputCandidates::new([], [input]);
+        let params = SelectorParams::new(
+            FeeRate::from_sat_per_vb_u32(2),
+            vec![Output::with_script(spk.clone(), Amount::from_sat(10_000))],
+            ChangeScript::from_script(spk, Weight::ZERO),
+        );
+        let mut selector = Selector::new(&candidates, params)?;
+
+        let mut target = selector.target();
+        target.max_weight = None;
+        let uncapped = selector.inner().with_target(target);
+        *selector.inner_mut() = uncapped;
+
+        assert_eq!(selector.max_weight(), None);
+        selector.select_all();
+        assert!(selector.try_finalize().is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn try_finalize_checks_weight_with_change() -> anyhow::Result<()> {
+        let input = setup_cltv_input(absolute::LockTime::from_consensus(10_000))?;
+        let spk = input.prev_txout().script_pubkey.clone();
+        let candidates = InputCandidates::new([], [input]);
+        let make_params = || {
+            SelectorParams::new(
+                FeeRate::from_sat_per_vb_u32(2),
+                vec![Output::with_script(spk.clone(), Amount::from_sat(10_000))],
+                ChangeScript::from_script(spk.clone(), Weight::ZERO),
+            )
+        };
+
+        // The changeless transaction fits, but the change output does not.
+        let without_change = {
+            let mut selector = Selector::new(&candidates, make_params())?;
+            selector.select_all();
+            selector.inner().weight(bdk_coin_select::DrainWeights::NONE)
+        };
+        let mut params = make_params();
+        params.max_weight = Weight::from_wu(without_change);
+
+        let mut selector = Selector::new(&candidates, params)?;
+        selector.select_until_target_met()?;
+        assert!(matches!(
+            selector.try_finalize(),
+            Err(SelectorError::MaxWeightExceeded)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn lowest_fee_bnb_drops_change_below_change_min_value() -> anyhow::Result<()> {
+        let input = setup_cltv_input(absolute::LockTime::from_consensus(10_000))?;
+        let spk = input.prev_txout().script_pubkey.clone();
+        let candidates = InputCandidates::new([], [input]);
+
+        // About 19,000 sats of change, below `change_min_value`.
+        let mut params = SelectorParams::new(
+            FeeRate::from_sat_per_vb_u32(2),
+            vec![Output::with_script(
+                spk.clone(),
+                Amount::ONE_BTC - Amount::from_sat(20_000),
+            )],
+            ChangeScript::from_script(spk, Weight::ZERO),
+        );
+        params.change_min_value = Some(Amount::from_sat(50_000));
+
+        let selection = candidates.into_selection(
+            selection_algorithm_lowest_fee_bnb(FeeRate::from_sat_per_vb_u32(1), 100_000),
+            params,
+        )?;
+        assert_eq!(
+            selection.outputs().len(),
+            1,
+            "change below change_min_value must be dropped"
+        );
         Ok(())
     }
 }
